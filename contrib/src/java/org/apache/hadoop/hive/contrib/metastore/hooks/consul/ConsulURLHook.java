@@ -26,6 +26,7 @@ import org.apache.hadoop.hive.metastore.HiveMetaException;
 import org.apache.hadoop.hive.metastore.hooks.URIResolverHook;
 import org.apache.http.client.utils.URIBuilder;
 
+import javax.annotation.Nullable;
 import javax.ws.rs.core.UriBuilder;
 import java.net.URI;
 import java.net.URL;
@@ -69,6 +70,7 @@ public class ConsulURLHook implements URIResolverHook {
         LOG.info("Resolving consul uri : " + uri);
         String consulHost = uri.getHost();
         String service = uri.getPath().substring(1);  //strip leading slash
+        String queryParams = uri.getQuery();
         int consulPort = uri.getPort();
 
         // check that agentHost has scheme or not
@@ -82,7 +84,9 @@ public class ConsulURLHook implements URIResolverHook {
             throw new IllegalArgumentException("Unspecified consul service, please use consul://consul-host:consul-port/service-name");
         }
 
-        String url = assembleUrl(consulHost, consulPort, service);
+        String targetDc = extractDcParam(queryParams);
+
+        String url = assembleUrl(consulHost, consulPort, service, targetDc);
         RawResponse rawResponse = httpTransport.makeGetRequest(url);
         Response<List<HealthService>> healthyServices;
         if (rawResponse.getStatusCode() == 200) {
@@ -117,13 +121,34 @@ public class ConsulURLHook implements URIResolverHook {
         return thriftUris;
     }
 
-    public static String assembleUrl(String host, int port, String service) throws HiveMetaException {
+    private static String extractDcParam(String queryParams) {
+        String targetDc = null;
+        if (queryParams != null) {
+            if (queryParams.split("&").length != 1) {
+                throw new IllegalArgumentException("Consul string query parameter can only contain one key/value");
+            }
+            String[] paramKv = queryParams.split("=");
+            if (paramKv.length != 2) {
+                throw new IllegalArgumentException("Consul string query parameter isn't in the format dc=value");
+            }
+            if (!paramKv[0].equals("dc")) {
+                throw new IllegalArgumentException("Consul string query parameter can only be \"dc\"");
+            }
+            targetDc = paramKv[1];
+        }
+        return targetDc;
+    }
+
+    public static String assembleUrl(String host, int port, String service, @Nullable String targetDc) throws HiveMetaException {
         try {
             URIBuilder builder = new URIBuilder("/v1/health/service/" + service);
             builder.setHost(host)
                     .setPort(port)
                     .setParameter("passing", null)
                     .setScheme("http");
+            if (targetDc != null) {
+                builder.setParameter("dc", targetDc);
+            }
             return builder.build().toASCIIString();
         } catch (Exception e) {
             throw new HiveMetaException("Can't encode url", e);
