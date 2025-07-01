@@ -20,7 +20,7 @@ package org.apache.hadoop.hive.metastore;
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.collect.Lists;
 
-import org.apache.commons.lang.StringUtils;
+import org.apache.commons.lang3.StringUtils;
 import org.apache.hadoop.hive.metastore.events.AlterPartitionEvent;
 import org.apache.hadoop.hive.metastore.events.AlterTableEvent;
 import org.apache.hadoop.hive.metastore.messaging.EventMessage;
@@ -193,79 +193,90 @@ public class HiveAlterHandler implements AlterHandler {
       // 2) the table is not an external table, and
       // 3) the user didn't change the default location (or new location is empty), and
       // 4) the table was not initially created with a specified location
-      if (rename
-          && !oldt.getTableType().equals(TableType.VIRTUAL_VIEW.toString())
-          && (oldt.getSd().getLocation().compareTo(newt.getSd().getLocation()) == 0
-            || StringUtils.isEmpty(newt.getSd().getLocation()))
-          && !MetaStoreUtils.isExternalTable(oldt)) {
-        Database olddb = msdb.getDatabase(dbname);
-        // if a table was created in a user specified location using the DDL like
-        // create table tbl ... location ...., it should be treated like an external table
-        // in the table rename, its data location should not be changed. We can check
-        // if the table directory was created directly under its database directory to tell
-        // if it is such a table
+      boolean renamedManagedTable = rename && !oldt.getTableType().equals(TableType.VIRTUAL_VIEW.toString())
+              && (oldt.getSd().getLocation().compareTo(newt.getSd().getLocation()) == 0
+              || StringUtils.isEmpty(newt.getSd().getLocation()))
+              && (!MetaStoreUtils.isExternalTable(oldt));
+      boolean renamedTranslatedToExternalTable = rename && MetaStoreUtils.isTranslatedToExternalTable(oldt)
+              && MetaStoreUtils.isTranslatedToExternalTable(newt);
+      boolean renamedExternalTable = rename && MetaStoreUtils.isExternalTable(oldt)
+              && !MetaStoreUtils.isPropertyTrue(oldt.getParameters(), "TRANSLATED_TO_EXTERNAL");
+
+
+      if (renamedManagedTable || renamedTranslatedToExternalTable || renamedExternalTable) {
+
         srcPath = new Path(oldt.getSd().getLocation());
-        String oldtRelativePath = (new Path(olddb.getLocationUri()).toUri())
-            .relativize(srcPath.toUri()).toString();
-        boolean tableInSpecifiedLoc = !oldtRelativePath.equalsIgnoreCase(name)
-            && !oldtRelativePath.equalsIgnoreCase(name + Path.SEPARATOR);
 
-        if (!tableInSpecifiedLoc) {
-          srcFs = wh.getFs(srcPath);
+        if (!renamedExternalTable) {
+          Database olddb = msdb.getDatabase(dbname);
+          // if a table was created in a user specified location using the DDL like
+          // create table tbl ... location ...., it should be treated like an external table
+          // in the table rename, its data location should not be changed. We can check
+          // if the table directory was created directly under its database directory to tell
+          // if it is such a table
 
-          // get new location
-          Database db = msdb.getDatabase(newt.getDbName());
-          Path databasePath = constructRenamedPath(wh.getDatabasePath(db), srcPath);
-          destPath = new Path(databasePath, newt.getTableName().toLowerCase());
-          destFs = wh.getFs(destPath);
+          String oldtRelativePath = (new Path(olddb.getLocationUri()).toUri())
+                  .relativize(srcPath.toUri()).toString();
+          boolean tableInSpecifiedLoc = !oldtRelativePath.equalsIgnoreCase(name)
+                  && !oldtRelativePath.equalsIgnoreCase(name + Path.SEPARATOR);
 
-          newt.getSd().setLocation(destPath.toString());
+          if (!tableInSpecifiedLoc) {
+            srcFs = wh.getFs(srcPath);
 
-          // check that destination does not exist otherwise we will be
-          // overwriting data
-          // check that src and dest are on the same file system
-          if (!FileUtils.equalsFileSystem(srcFs, destFs)) {
-            throw new InvalidOperationException("table new location " + destPath
-                + " is on a different file system than the old location "
-                + srcPath + ". This operation is not supported");
-          }
+            // get new location
+            Database db = msdb.getDatabase(newt.getDbName());
+            Path databasePath = constructRenamedPath(wh.getDatabasePath(db), srcPath);
+            destPath = new Path(databasePath, newt.getTableName().toLowerCase());
+            destFs = wh.getFs(destPath);
 
-          try {
-            if (destFs.exists(destPath)) {
-              throw new InvalidOperationException("New location for this table "
-                  + newt.getDbName() + "." + newt.getTableName()
-                  + " already exists : " + destPath);
+            newt.getSd().setLocation(destPath.toString());
+
+            // check that destination does not exist otherwise we will be
+            // overwriting data
+            // check that src and dest are on the same file system
+            if (!FileUtils.equalsFileSystem(srcFs, destFs)) {
+              throw new InvalidOperationException("table new location " + destPath
+                      + " is on a different file system than the old location "
+                      + srcPath + ". This operation is not supported");
             }
-            // check that src exists and also checks permissions necessary, rename src to dest
-            if (srcFs.exists(srcPath) && srcFs.rename(srcPath, destPath)) {
-              dataWasMoved = true;
-            }
-          } catch (IOException e) {
-            LOG.error("Alter Table operation for " + dbname + "." + name + " failed.", e);
-            throw new InvalidOperationException("Alter Table operation for " + dbname + "." + name +
-                " failed to move data due to: '" + getSimpleMessage(e)
-                + "' See hive log file for details.");
-          }
-          String oldTblLocPath = srcPath.toUri().getPath();
-          String newTblLocPath = destPath.toUri().getPath();
 
-          // also the location field in partition
-          List<Partition> parts = msdb.getPartitions(dbname, name, -1);
-          for (Partition part : parts) {
-            String oldPartLoc = part.getSd().getLocation();
-            if (oldPartLoc.contains(oldTblLocPath)) {
-              URI oldUri = new Path(oldPartLoc).toUri();
-              String newPath = oldUri.getPath().replace(oldTblLocPath, newTblLocPath);
-              Path newPartLocPath = new Path(oldUri.getScheme(), oldUri.getAuthority(), newPath);
-              part.getSd().setLocation(newPartLocPath.toString());
-              String oldPartName = Warehouse.makePartName(oldt.getPartitionKeys(), part.getValues());
-              try {
-                //existing partition column stats is no longer valid, remove them
-                msdb.deletePartitionColumnStatistics(dbname, name, oldPartName, part.getValues(), null);
-              } catch (InvalidInputException iie) {
-                throw new InvalidOperationException("Unable to update partition stats in table rename." + iie);
+            try {
+              if (destFs.exists(destPath)) {
+                throw new InvalidOperationException("New location for this table "
+                        + newt.getDbName() + "." + newt.getTableName()
+                        + " already exists : " + destPath);
               }
-              msdb.alterPartition(dbname, name, part.getValues(), part);
+              // check that src exists and also checks permissions necessary, rename src to dest
+              if (srcFs.exists(srcPath) && srcFs.rename(srcPath, destPath)) {
+                dataWasMoved = true;
+              }
+            } catch (IOException e) {
+              LOG.error("Alter Table operation for " + dbname + "." + name + " failed.", e);
+              throw new InvalidOperationException("Alter Table operation for " + dbname + "." + name +
+                      " failed to move data due to: '" + getSimpleMessage(e)
+                      + "' See hive log file for details.");
+            }
+            String oldTblLocPath = srcPath.toUri().getPath();
+            String newTblLocPath = destPath.toUri().getPath();
+
+            // also the location field in partition
+            List<Partition> parts = msdb.getPartitions(dbname, name, -1);
+            for (Partition part : parts) {
+              String oldPartLoc = part.getSd().getLocation();
+              if (oldPartLoc.contains(oldTblLocPath)) {
+                URI oldUri = new Path(oldPartLoc).toUri();
+                String newPath = oldUri.getPath().replace(oldTblLocPath, newTblLocPath);
+                Path newPartLocPath = new Path(oldUri.getScheme(), oldUri.getAuthority(), newPath);
+                part.getSd().setLocation(newPartLocPath.toString());
+                String oldPartName = Warehouse.makePartName(oldt.getPartitionKeys(), part.getValues());
+                try {
+                  //existing partition column stats is no longer valid, remove them
+                  msdb.deletePartitionColumnStatistics(dbname, name, oldPartName, part.getValues(), null);
+                } catch (InvalidInputException iie) {
+                  throw new InvalidOperationException("Unable to update partition stats in table rename." + iie);
+                }
+                msdb.alterPartition(dbname, name, part.getValues(), part);
+              }
             }
           }
         }

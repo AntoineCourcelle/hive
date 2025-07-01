@@ -1516,6 +1516,17 @@ public class MetaStoreUtils {
     return Boolean.parseBoolean(params.get(EXTERNAL_TABLE_PROP));
   }
 
+  public static boolean isTranslatedToExternalTable(Table table) {
+    Map<String, String> params = table.getParameters();
+    return params != null && MetaStoreUtils.isPropertyTrue(params, "EXTERNAL")
+            && MetaStoreUtils.isPropertyTrue(params, "TRANSLATED_TO_EXTERNAL") && table.getSd() != null
+            && table.getSd().isSetLocation();
+  }
+
+  public static boolean isPropertyTrue(Map<String, String> tableParams, String prop) {
+    return "TRUE".equalsIgnoreCase(tableParams.get(prop));
+  }
+
   /**
    * Determines whether a table is an immutable table.
    * Immutable tables are write-once/replace, and do not support append. Partitioned
